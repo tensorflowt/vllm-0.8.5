@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Benchmark the efficiency of prefix caching.
 
@@ -19,18 +20,48 @@ ShareGPT example usage:
     # between 128 and 256 tokens from the ShareGPT dataset,
     # then replicates each prompt 5 times.
     python benchmark_prefix_caching.py \
-        --model meta-llama/Llama-2-7b-chat-hf \
+        --model /work/models/Qwen/Qwen2___5-7B-Instruct \
         --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json \
         --enable-prefix-caching \
         --num-prompts 20 \
         --repeat-count 5 \
         --input-length-range 128:256
+
+# lmcache-单卡
+CUDA_VISIBLE_DEVICES=2 \
+python3 benchmark_prefix_caching_lmcache.py \
+    --model /work/models/Qwen/Qwen2___5-7B-Instruct \
+    --dataset-path /work/dataset/ShareGPT_V3_unfiltered_cleaned_split.json \
+    --enable-prefix-caching \
+    --num-prompts 100 \
+    --repeat-count 1 \
+    --input-length-range 1024:2048 \
+    --gpu_memory_utilization 0.8 \
+    --tensor_parallel_size 1 \
+    --enable_lmcache 
+
+# lmcache-多卡
+CUDA_VISIBLE_DEVICES=1,2 \
+python3 benchmark_prefix_caching_lmcache.py \
+    --model /work/models/Qwen/Qwen3-30B-A3B-FP8 \
+    --reasoning-parser deepseek_r1 \
+    --tensor-parallel-size 2 \
+    --dataset-path /work/dataset/ShareGPT_V3_unfiltered_cleaned_split.json \
+    --enable-prefix-caching \
+    --num-prompts 100 \
+    --repeat-count 5 \
+    --input-length-range 1024:2048 \
+    --gpu_memory_utilization 0.8 \
+    --tensor_parallel_size 2 \
+    --enable_lmcache 
 """
 
 import dataclasses
 import json
 import random
 import time
+import os
+import logging
 from typing import Optional
 
 from transformers import PreTrainedTokenizerBase
@@ -38,6 +69,11 @@ from transformers import PreTrainedTokenizerBase
 from vllm import LLM, SamplingParams
 from vllm.engine.arg_utils import EngineArgs
 from vllm.utils import FlexibleArgumentParser
+
+# lmcache
+from lmcache.v1.cache_engine import LMCacheEngineBuilder
+from lmcache.integration.vllm.utils import ENGINE_NAME
+from vllm.config import KVTransferConfig
 
 try:
     from vllm.transformers_utils.tokenizer import get_tokenizer
@@ -128,7 +164,6 @@ def sample_requests_from_random(
     fixed_output_len: Optional[int],
     prefix_len: int,
 ) -> list[Request]:
-
     requests = []
     prefix_token_ids = sample_tokens(tokenizer, prefix_len)
     min_len, max_len = input_length_range
@@ -155,7 +190,6 @@ def repeat_and_sort_requests(requests: list[Request],
     else:
         random.shuffle(repeated_requests)
     return [req.prompt for req in repeated_requests]
-
 
 def main(args):
     tokenizer = get_tokenizer(args.model, trust_remote_code=True)
@@ -194,8 +228,39 @@ def main(args):
 
     engine_args = EngineArgs.from_cli_args(args)
 
-    llm = LLM(**dataclasses.asdict(engine_args))
+    if args.enable_lmcache:
+        env_vars = {
+        "LMCACHE_CHUNK_SIZE": "256",              # Set tokens per chunk
+        "LMCACHE_LOCAL_CPU": "True",  
+        "LMCACHE_MAX_LOCAL_DISK_SIZE": "600",
+        "LMCACHE_USE_EXPERIMENTAL": "True",       # Enable local CPU backend
+        "LMCACHE_MAX_LOCAL_CPU_SIZE": "200"   # Dynamic CPU memory limit (GB)
+        }
 
+        for key, value in env_vars.items():
+            os.environ[key] = value
+
+        ktc = KVTransferConfig(
+            kv_connector="LMCacheConnectorV1",
+            kv_role="kv_both",
+        )
+
+        engine_args.kv_transfer_config = ktc
+
+        llm = LLM(model=args.model,
+            kv_transfer_config=ktc,
+            max_model_len=args.model_max_len,
+            enable_prefix_caching=False,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            tensor_parallel_size=args.tensor_parallel_size)
+
+    else:
+        llm = LLM(model=args.model,
+            max_model_len=args.model_max_len,
+            enable_prefix_caching=False,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            tensor_parallel_size=args.tensor_parallel_size)
+        
     sampling_params = SamplingParams(temperature=0,
                                      max_tokens=args.output_len,
                                      detokenize=not args.disable_detokenize)
@@ -213,31 +278,37 @@ def main(args):
     )
 
 
-if __name__ == "__main__":
+def create_argument_parser():
     parser = FlexibleArgumentParser(
-        description=
-        'Benchmark the performance with or without automatic prefix caching.')
-    parser.add_argument("--dataset-path",
-                        type=str,
-                        default=None,
-                        help="Path to the dataset.")
-    parser.add_argument('--output-len', type=int, default=10)
-    parser.add_argument('--num-prompts',
-                        type=int,
-                        required=True,
-                        help="Number of the prompts sampled from dataset")
-    parser.add_argument('--repeat-count',
-                        type=int,
-                        default=1,
-                        help='Number of times to repeat each prompt')
-    parser.add_argument('--sort',
-                        action='store_true',
-                        help='Sort prompts by input length')
-    parser.add_argument('--input-length-range',
-                        type=str,
-                        required=True,
-                        help='Range of input lengths for sampling prompts,'
-                        'specified as "min:max" (e.g., "128:256").')
+        description="Benchmark the performance with or without "
+        "automatic prefix caching."
+    )
+    parser.add_argument(
+        "--dataset-path", type=str, default=None, help="Path to the dataset."
+    )
+    parser.add_argument("--output-len", type=int, default=10)
+    parser.add_argument(
+        "--num-prompts",
+        type=int,
+        required=True,
+        help="Number of the prompts sampled from dataset",
+    )
+    parser.add_argument(
+        "--repeat-count",
+        type=int,
+        default=1,
+        help="Number of times to repeat each prompt",
+    )
+    parser.add_argument(
+        "--sort", action="store_true", help="Sort prompts by input length"
+    )
+    parser.add_argument(
+        "--input-length-range",
+        type=str,
+        required=True,
+        help="Range of input lengths for sampling prompts,"
+        'specified as "min:max" (e.g., "128:256").',
+    )
     parser.add_argument(
         "--prefix-len",
         type=int,
@@ -248,12 +319,42 @@ if __name__ == "__main__":
         "when dataset-path is not provided.",
     )
     parser.add_argument(
-        '--disable-detokenize',
-        action='store_true',
-        help=("Do not detokenize responses (i.e. do not include "
-              "detokenization time in the latency measurement)"),
+        "--disable-detokenize",
+        action="store_true",
+        help=(
+            "Do not detokenize responses (i.e. do not include "
+            "detokenization time in the latency measurement)"
+        ),
     )
-
+    parser.add_argument(
+        "--enable-lmcache", 
+        action="store_true",
+        help="Enable LMCache for offloading (default: True)"
+    )
+    parser.add_argument(
+        "--gpu_memory_utilization", 
+        type=float, 
+        default=0.8, 
+        help="gpu memory utilization"
+    )
+    parser.add_argument(
+        "--model_max_len",
+        type=int,
+        default=32768,
+        help="model max len",
+    )
+    parser.add_argument(
+        "--tensor_parallel_size",
+        type=int,
+        default=2,
+        help="tensor parallel size",
+    )
     parser = EngineArgs.add_cli_args(parser)
+
+    return parser
+
+
+if __name__ == "__main__":
+    parser = create_argument_parser()
     args = parser.parse_args()
     main(args)
