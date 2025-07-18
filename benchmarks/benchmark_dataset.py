@@ -35,6 +35,7 @@ from transformers import PreTrainedTokenizerBase
 from vllm.lora.request import LoRARequest
 from vllm.lora.utils import get_adapter_absolute_path
 from vllm.multimodal import MultiModalDataDict
+from vllm.multimodal.image import convert_image_mode
 from vllm.transformers_utils.tokenizer import AnyTokenizer, get_lora_tokenizer
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,33 @@ class SampleRequest:
     multi_modal_data: Optional[Union[MultiModalDataDict, dict]] = None
     lora_request: Optional[LoRARequest] = None
 
+
+def repeat_sample_requests(requests: list[SampleRequest], repeat_count: int, mode: str) -> list[SampleRequest]:  
+        """  
+        Repeat each SampleRequest in the list for a specified number of times.  
+        
+        Args:  
+            requests: A list of SampleRequest objects to be repeated.  
+            repeat_count: The number of times each request is repeated.  
+            mode: The mode of repetition ('random', 'tile', 'interleave').  
+        
+        Returns:  
+            A list of repeated SampleRequest objects.  
+        """  
+        if mode == "random":  
+            repeated_requests = requests * repeat_count  
+            random.shuffle(repeated_requests)  
+            return repeated_requests  
+        elif mode == "tile":  
+            return requests * repeat_count  
+        elif mode == "interleave":  
+            repeated_requests = []  
+            for request in requests:  
+                repeated_requests.extend([request] * repeat_count)  
+            return repeated_requests  
+        else:  
+            raise ValueError(f"Invalid mode: {mode}, only support 'random', 'tile', 'interleave'")
+        
 
 # -----------------------------------------------------------------------------
 # Benchmark Dataset Base Class
@@ -159,7 +187,10 @@ class BenchmarkDataset(ABC):
 
     @abstractmethod
     def sample(self, tokenizer: PreTrainedTokenizerBase,
-               num_requests: int) -> list[SampleRequest]:
+        num_requests: int,
+        repeat_count: int = 1,  
+        repeat_mode: str = "random"  
+    ) -> list[SampleRequest]:
         """
         Abstract method to generate sample requests from the dataset.
 
@@ -182,7 +213,6 @@ class BenchmarkDataset(ABC):
         """
         Oversamples the list of requests if its size is less than the desired
         number.
-
         Args:
             requests (List[SampleRequest]): The current list of sampled
             requests.  num_requests (int): The target number of requests.
@@ -194,7 +224,6 @@ class BenchmarkDataset(ABC):
             requests.extend(additional)
             logger.info("Oversampled requests to reach %d total samples.",
                         num_requests)
-
 
 # -----------------------------------------------------------------------------
 # Utility Functions and Global Caches
@@ -307,6 +336,8 @@ class RandomDataset(BenchmarkDataset):
         range_ratio: float = DEFAULT_RANGE_RATIO,
         input_len: int = DEFAULT_INPUT_LEN,
         output_len: int = DEFAULT_OUTPUT_LEN,
+        repeat_count: int = 1,  # 新增参数  
+        repeat_mode: str = "random",  # 新增参数 
         **kwargs,
     ) -> list[SampleRequest]:
         # Enforce range_ratio < 1
@@ -318,8 +349,11 @@ class RandomDataset(BenchmarkDataset):
         num_special_tokens = tokenizer.num_special_tokens_to_add()
         real_input_len = input_len - num_special_tokens
 
-        prefix_token_ids = (np.random.randint(
-            0, vocab_size, size=prefix_len).tolist() if prefix_len > 0 else [])
+        prefix_token_ids = (
+            np.random.randint(0, vocab_size, size=prefix_len).tolist()
+            if prefix_len > 0
+            else []
+        )
 
         # New sampling logic: [X * (1 - b), X * (1 + b)]
         input_low = int(real_input_len * (1 - range_ratio))
@@ -332,18 +366,21 @@ class RandomDataset(BenchmarkDataset):
         logger.info("Sampling output_len from [%s, %s]", output_low,
                     output_high)
 
+        # 调整生成初始请求的数量，确保重复后能达到目标数量  
+        target_initial_samples = (num_requests + repeat_count - 1) // repeat_count  
+
         input_lens = np.random.randint(input_low,
                                        input_high + 1,
-                                       size=num_requests)
+                                       size=target_initial_samples) 
         output_lens = np.random.randint(output_low,
                                         output_high + 1,
-                                        size=num_requests)
+                                        size=target_initial_samples)  
         offsets = np.random.randint(0, vocab_size, size=num_requests)
 
-        requests = []
-        for i in range(num_requests):
+        initial_requests = []
+        for i in range(target_initial_samples):
             inner_seq = ((offsets[i] + i + np.arange(input_lens[i])) %
-                         vocab_size).tolist()
+                vocab_size).tolist()
             token_sequence = prefix_token_ids + inner_seq
             prompt = tokenizer.decode(token_sequence)
             # After decoding the prompt we have to encode and decode it again.
@@ -358,12 +395,23 @@ class RandomDataset(BenchmarkDataset):
                 prompt, add_special_tokens=False)[:input_lens[i]]
             prompt = tokenizer.decode(re_encoded_sequence)
             total_input_len = prefix_len + int(input_lens[i])
-            requests.append(
+            initial_requests.append(
                 SampleRequest(
                     prompt=prompt,
                     prompt_len=total_input_len,
                     expected_output_len=int(output_lens[i]),
-                ))
+                )
+            )
+        
+        # 应用重复逻辑  
+        if repeat_count > 1:  
+            requests = repeat_sample_requests(initial_requests, repeat_count, repeat_mode)  
+            # 截断到目标数量  
+            requests = requests[:num_requests]  
+        else:  
+            requests = initial_requests  
+        # 确保最终数量达到要求（如果需要）  
+        self.maybe_oversample_requests(requests, num_requests)  
         return requests
 
 
@@ -404,11 +452,17 @@ class ShareGPTDataset(BenchmarkDataset):
         max_loras: Optional[int] = None,
         output_len: Optional[int] = None,
         enable_multimodal_chat: bool = False,
+        repeat_count: int = 1,  
+        repeat_mode: str = "random", 
         **kwargs,
     ) -> list:
-        samples: list = []
+        
+        # 计算初始采样数量，确保重复后能达到目标数量  
+        target_initial_samples = (num_requests + repeat_count - 1) # repeat_count  
+
+        initial_samples: list = []
         for entry in self.data:
-            if len(samples) >= num_requests:
+            if len(initial_samples) >= target_initial_samples:
                 break
             prompt, completion = (
                 entry["conversations"][0]["value"],
@@ -430,13 +484,23 @@ class ShareGPTDataset(BenchmarkDataset):
             if enable_multimodal_chat:
                 prompt = self.apply_multimodal_chat_transformation(
                     prompt, None)
-            samples.append(
+            initial_samples.append(
                 SampleRequest(
                     prompt=prompt,
                     prompt_len=prompt_len,
                     expected_output_len=new_output_len,
                     lora_request=lora_request,
-                ))
+                )
+            )
+        
+        # 应用重复逻辑  
+        if repeat_count > 1:  
+            samples = repeat_sample_requests(initial_samples, repeat_count, repeat_mode)  
+            # 截断到目标数量  
+            samples = samples[:num_requests]  
+        else:  
+            samples = initial_samples
+
         self.maybe_oversample_requests(samples, num_requests)
         return samples
 
