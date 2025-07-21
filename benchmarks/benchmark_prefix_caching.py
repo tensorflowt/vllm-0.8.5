@@ -277,8 +277,8 @@ def main(args):
         sampling_params=sampling_params,
     )
 
-
-def create_argument_parser():
+if __name__ == "__main__":
+    
     parser = FlexibleArgumentParser(
         description="Benchmark the performance with or without "
         "automatic prefix caching."
@@ -351,10 +351,5 @@ def create_argument_parser():
     )
     parser = EngineArgs.add_cli_args(parser)
 
-    return parser
-
-
-if __name__ == "__main__":
-    parser = create_argument_parser()
     args = parser.parse_args()
     main(args)

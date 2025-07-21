@@ -1,6 +1,7 @@
 # 服务启动(vllm默认开启方式-tp2)
 ```
 CUDA_VISIBLE_DEVICES=1,2 \
+nohup \
 vllm serve \
  /work/models/Qwen/Qwen3-30B-A3B-FP8 \
 --served-model-name qwen3-30b \
@@ -9,10 +10,10 @@ vllm serve \
 --tensor-parallel-size 2  \
 --trust-remote-code \
 --host 0.0.0.0 \
---port 8300
+--port 8300 > /work/code/vllm-0.9.0/exp/run_vllm_base_serve.log 2>&1 &
 ```
 
-# 服务启动-lmcache-cpu-offload
+# 服务启动-lmcache-cpu-offload(注意需要指定yaml文件路径)
 ```
 CUDA_VISIBLE_DEVICES=4,5 \
 LMCACHE_CHUNK_SIZE=256 \
@@ -21,6 +22,7 @@ LMCACHE_MAX_LOCAL_CPU_SIZE=200 \
 LMCACHE_MAX_LOCAL_DISK_SIZE=400 \
 LMCACHE_CONFIG_FILE="cpu-offload.yaml" \
 LMCACHE_USE_EXPERIMENTAL=True \
+nohup \
 vllm serve \
     /work/models/Qwen/Qwen3-30B-A3B-FP8 \
     --served-model-name qwen3-30b \
@@ -30,7 +32,7 @@ vllm serve \
     --trust-remote-code \
     --port 8301 \
     --kv-transfer-config \
-    '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}'
+    '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}' > /work/code/vllm-0.9.0/exp/run_vllm_lmcache_cpu_offload_serve.log 2>&1 &
 ```
 
 ## cpu-offload.yaml
