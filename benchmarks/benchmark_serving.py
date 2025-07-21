@@ -20,7 +20,6 @@ On the client side, run:
         --endpoint /generate_stream
     to the end of the command above.
 """
-
 import argparse
 import asyncio
 import gc
